@@ -320,7 +320,73 @@
     }
 
     function norm(s) {
-      return (s == null ? '' : String(s)).toLowerCase().trim();
+      return (s == null ? '' : String(s))
+        .normalize('NFD')
+        .replace(/[̀-ͯ]/g, '') // strip diacritics
+        .toLowerCase()
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+
+    // Aliases canónicos → cualquiera de estas variantes normalizadas calza
+    const CANON_ALIAS = {
+      'N° Inventario': ['n° inventario','n inventario','no inventario','nro inventario','numero inventario','n. inventario','inventario'],
+      'Serie':         ['serie','n° serie','n serie','numero de serie','nro serie','serial'],
+      'Equipo':        ['equipo','nombre equipo','nombre del equipo','denominacion','denominacion equipo'],
+      'Servicio':      ['servicio','servicio clinico','servicio clínico'],
+      'Marca':         ['marca'],
+      'Modelo':        ['modelo'],
+      'Ubicación':     ['ubicacion','ubicación','ubic'],
+      'Clasificación': ['clasificacion','clasificación','categoria','categoría'],
+      'N° Carpeta':    ['n° carpeta','n carpeta','no carpeta','nro carpeta','carpeta'],
+      'Unidad':        ['unidad','box','sala','cama'],
+      'Procedencia':   ['procedencia','origen'],
+      'Año Instalación': ['ano instalacion','ano instalación','año instalacion','año instalación','anio instalacion','fecha instalacion','año'],
+      'Vida Útil Residual': ['vida util residual','vida útil residual','vur'],
+      'ENU/Baja':      ['enu/baja','enu baja','enu','baja'],
+      'Frecuencia MP': ['frecuencia mp','frecuencia','frec mp','frec.']
+    };
+
+    // Devuelve el valor real desde un ident usando aliases del canónico
+    function getIdent(ident, canon) {
+      if (ident[canon] !== undefined && ident[canon] !== '') return ident[canon];
+      const aliases = CANON_ALIAS[canon] || [];
+      for (const k of Object.keys(ident)) {
+        if (aliases.includes(norm(k))) return ident[k];
+      }
+      // Fallback: comparación normalizada con el propio canon
+      const cnorm = norm(canon);
+      for (const k of Object.keys(ident)) {
+        if (norm(k) === cnorm) return ident[k];
+      }
+      return '';
+    }
+
+    // Meses: aliases (corto, largo, abreviado)
+    const MES_ALIAS = {
+      Ene:['ene','enero','jan','january','1','01'],
+      Feb:['feb','febrero','february','2','02'],
+      Mar:['mar','marzo','march','3','03'],
+      Abr:['abr','abril','april','4','04'],
+      May:['may','mayo','5','05'],
+      Jun:['jun','junio','june','6','06'],
+      Jul:['jul','julio','july','7','07'],
+      Ago:['ago','agosto','august','aug','8','08'],
+      Sep:['sep','sept','septiembre','september','9','09'],
+      Oct:['oct','octubre','october','10'],
+      Nov:['nov','noviembre','november','11'],
+      Dic:['dic','diciembre','december','dec','12']
+    };
+
+    function mesDe(headerVal) {
+      const v = norm(headerVal);
+      if (!v) return null;
+      for (const m of MESES) {
+        if (MES_ALIAS[m].includes(v)) return m;
+        // tolerar variantes con punto: "ene."
+        if (MES_ALIAS[m].includes(v.replace(/\./g,''))) return m;
+      }
+      return null;
     }
 
     function badgeClasses(codigo) {
@@ -382,43 +448,80 @@
     }
 
     // ───── Carga de Excel ─────
+    const IGNORADAS_NORM = COLS_IGNORADAS.map(c => norm(c));
+
+    function esColumnaIgnorada(name) {
+      return IGNORADAS_NORM.includes(norm(name));
+    }
+
+    // Detecta índices de columnas mensuales en un header simple (PMP_2026)
+    function detectarMesesHeader(header) {
+      const monthIdx = {};
+      header.forEach((h, i) => {
+        const m = mesDe(h);
+        if (m && monthIdx[m] == null) monthIdx[m] = i;
+      });
+      return monthIdx;
+    }
+
+    // Detecta columnas mensuales con sub-cabeceras P/R (Registro_MP-2026)
+    // Soporta header en una o dos filas. Retorna { Ene:{P:idx,R:idx}, ... } y headerRowsUsed.
+    function detectarRegistroPR(rows) {
+      const r0 = (rows[0] || []).map(v => String(v ?? ''));
+      const r1 = (rows[1] || []).map(v => String(v ?? ''));
+      const monthCols = {};
+      let cur = null;
+      const W = Math.max(r0.length, r1.length);
+      for (let i = 0; i < W; i++) {
+        const m0 = mesDe(r0[i]);
+        if (m0) cur = m0;
+        const v1 = norm(r1[i]);
+        const sub = v1 === 'p' || v1 === 'programacion' ? 'P'
+                  : v1 === 'r' || v1 === 'resultado' || v1 === 'resultados' ? 'R'
+                  : null;
+        if (cur && sub) {
+          monthCols[cur] = monthCols[cur] || {};
+          monthCols[cur][sub] = i;
+        }
+      }
+      // Si no detectamos P/R en r1, devolver null para que el caller use el formato simple
+      const anyPR = Object.values(monthCols).some(o => o.P != null || o.R != null);
+      return anyPR ? { cols: monthCols, dataStart: 2 } : null;
+    }
+
     function cargarArchivo(file) {
       const reader = new FileReader();
       reader.onload = (e) => {
         try {
           const wb = XLSX.read(e.target.result, { type: 'array' });
-          const sheetName = wb.SheetNames.find(n => /PMP/i.test(n)) || wb.SheetNames[0];
-          const sheet = wb.Sheets[sheetName];
+          const sheetPMP = wb.SheetNames.find(n => /PMP/i.test(n)) || wb.SheetNames[0];
+          const sheet = wb.Sheets[sheetPMP];
           const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
           if (!rows.length) throw new Error('Hoja vacía');
 
           const header = rows[0].map(h => String(h ?? '').trim());
-          const colsValidas = header.map((h, i) => ({ name: h, i }))
-                                    .filter(c => c.name && !COLS_IGNORADAS.includes(c.name));
+          const monthIdx = detectarMesesHeader(header);
+          const monthIdxSet = new Set(Object.values(monthIdx));
 
-          // Detectar índices de columnas mensuales
-          const monthIdx = {};
-          MESES.forEach(m => {
-            const idx = header.findIndex(h => norm(h) === norm(m));
-            if (idx >= 0) monthIdx[m] = idx;
-          });
+          // Columnas de identificación: todo lo que no es mes, no está vacío, no está ignorado
+          const identCols = header
+            .map((h, i) => ({ name: h, i }))
+            .filter(c => c.name && !monthIdxSet.has(c.i) && !esColumnaIgnorada(c.name));
 
           const equipos = [];
           for (let r = 1; r < rows.length; r++) {
-            const row = rows[r];
+            const row = rows[r] || [];
             const ident = {};
-            colsValidas.forEach(c => {
-              if (MESES.includes(c.name)) return; // los meses van aparte
-              ident[c.name] = row[c.i] ?? '';
-            });
+            identCols.forEach(c => { ident[c.name] = row[c.i] ?? ''; });
             const programacion = MESES.map(m => {
               const idx = monthIdx[m];
               if (idx == null) return '';
-              const v = String(row[idx] ?? '').trim();
-              return v;
+              return String(row[idx] ?? '').trim();
             });
-            const resultados = MESES.map(() => ''); // No hidratamos resultados desde la hoja PMP
-            const hasInventario = norm(ident['N° Inventario']) !== '' || norm(ident['Serie']) !== '' || norm(ident['Equipo']) !== '';
+            const resultados = MESES.map(() => '');
+            const hasInventario = norm(getIdent(ident,'N° Inventario')) !== ''
+                              || norm(getIdent(ident,'Serie')) !== ''
+                              || norm(getIdent(ident,'Equipo')) !== '';
             equipos.push({
               id: r,
               ident,
@@ -430,10 +533,66 @@
             });
           }
 
+          // ── Hidratar resultados desde Registro_MP-2026 si existe ──
+          const sheetRegName = wb.SheetNames.find(n => /registro/i.test(n));
+          let regHidratados = 0;
+          if (sheetRegName) {
+            const rsheet = wb.Sheets[sheetRegName];
+            const rrows = XLSX.utils.sheet_to_json(rsheet, { header: 1, defval: '' });
+            if (rrows.length >= 2) {
+              const pr = detectarRegistroPR(rrows);
+              if (pr) {
+                // Buscar índice de N° Inventario y Serie en row 1 (asumiendo header en r0 o r1)
+                // Probamos r0 y r1 para encontrar columnas clave
+                const findKey = (canon) => {
+                  const aliases = (CANON_ALIAS[canon] || []).concat([norm(canon)]);
+                  for (const rowH of [rrows[0], rrows[1]]) {
+                    if (!rowH) continue;
+                    for (let i = 0; i < rowH.length; i++) {
+                      if (aliases.includes(norm(rowH[i]))) return i;
+                    }
+                  }
+                  return -1;
+                };
+                const idxInv = findKey('N° Inventario');
+                const idxSer = findKey('Serie');
+                for (let r = pr.dataStart; r < rrows.length; r++) {
+                  const row = rrows[r] || [];
+                  const inv = idxInv >= 0 ? norm(row[idxInv]) : '';
+                  const ser = idxSer >= 0 ? norm(row[idxSer]) : '';
+                  if (!inv && !ser) continue;
+                  const eq = equipos.find(e => {
+                    const eInv = norm(getIdent(e.ident,'N° Inventario'));
+                    const eSer = norm(getIdent(e.ident,'Serie'));
+                    return (inv && eInv === inv) || (ser && eSer === ser);
+                  });
+                  if (!eq) continue;
+                  MESES.forEach((m, i) => {
+                    const cells = pr.cols[m];
+                    if (!cells) return;
+                    if (cells.P != null) {
+                      const v = String(row[cells.P] ?? '').trim();
+                      if (v && !eq.programacion[i]) eq.programacion[i] = v;
+                    }
+                    if (cells.R != null) {
+                      const v = String(row[cells.R] ?? '').trim();
+                      if (v) eq.resultados[i] = v;
+                    }
+                  });
+                  regHidratados++;
+                }
+              }
+            }
+          }
+
           state.equipos = equipos;
           state.filename = file.name;
           state.colsDetectadas = header;
           state.filasDetectadas = equipos.length;
+          state.identCols = identCols.map(c => c.name);
+          state.hojaPMP = sheetPMP;
+          state.hojaReg = sheetRegName || null;
+          state.regHidratados = regHidratados;
 
           mostrarFeedbackCarga();
           render();
@@ -448,7 +607,10 @@
     function mostrarFeedbackCarga() {
       const fb = document.getElementById('loadFeedback');
       fb.classList.remove('hidden');
-      fb.innerHTML = `<span class="text-amber-400">●</span> Archivo cargado: <span class="text-zinc-200">${esc(state.filename)}</span> · <span class="text-zinc-200">${state.colsDetectadas.length}</span> columnas · <span class="text-zinc-200">${state.filasDetectadas}</span> filas`;
+      const regTxt = state.hojaReg
+        ? ` · Resultados hidratados desde <span class="text-zinc-200">${esc(state.hojaReg)}</span> (<span class="text-zinc-200">${state.regHidratados}</span>)`
+        : '';
+      fb.innerHTML = `<span class="text-amber-400">●</span> Archivo: <span class="text-zinc-200">${esc(state.filename)}</span> · Hoja <span class="text-zinc-200">${esc(state.hojaPMP)}</span> · <span class="text-zinc-200">${state.colsDetectadas.length}</span> columnas · <span class="text-zinc-200">${state.filasDetectadas}</span> filas${regTxt}`;
       const ls = document.getElementById('loadStatus');
       ls.classList.remove('hidden');
       ls.classList.add('flex');
@@ -464,13 +626,13 @@
     // ───── Búsqueda y render de resultados ─────
     function filtrar(q) {
       const nq = norm(q);
-      if (!nq) return state.equipos.slice(0, 30);
+      const visibles = state.equipos.filter(e => !e.slot);
+      if (!nq) return visibles.slice(0, 30);
       const out = [];
-      for (const eq of state.equipos) {
-        if (eq.slot) continue;
-        const inv = norm(eq.ident['N° Inventario']);
-        const ser = norm(eq.ident['Serie']);
-        const nom = norm(eq.ident['Equipo']);
+      for (const eq of visibles) {
+        const inv = norm(getIdent(eq.ident,'N° Inventario'));
+        const ser = norm(getIdent(eq.ident,'Serie'));
+        const nom = norm(getIdent(eq.ident,'Equipo'));
         if (inv.includes(nq) || ser.includes(nq) || nom.includes(nq)) {
           out.push(eq);
           if (out.length >= 50) break;
@@ -510,12 +672,12 @@
     }
 
     function tarjetaEquipo(eq) {
-      const nombre = esc(eq.ident['Equipo'] || '—');
-      const clas = esc(eq.ident['Clasificación'] || '');
-      const inv = esc(eq.ident['N° Inventario'] || '—');
-      const ser = esc(eq.ident['Serie'] || '—');
-      const mm  = esc([eq.ident['Marca'], eq.ident['Modelo']].filter(Boolean).join(' · '));
-      const srv = esc(eq.ident['Servicio'] || '');
+      const nombre = esc(getIdent(eq.ident,'Equipo') || '—');
+      const clas = esc(getIdent(eq.ident,'Clasificación') || '');
+      const inv = esc(getIdent(eq.ident,'N° Inventario') || '—');
+      const ser = esc(getIdent(eq.ident,'Serie') || '—');
+      const mm  = esc([getIdent(eq.ident,'Marca'), getIdent(eq.ident,'Modelo')].filter(Boolean).join(' · '));
+      const srv = esc(getIdent(eq.ident,'Servicio') || '');
       const clasBadge = clas
         ? `<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] mono font-semibold uppercase tracking-wider border bg-amber-500/10 border-amber-500/40 text-amber-300">${clas}</span>`
         : '';
@@ -567,7 +729,7 @@
       });
       // Stub "Registrar evento"
       modalFooter.querySelector('[data-registrar]')?.addEventListener('click', () => {
-        console.log('Registrar evento — equipo:', eq.ident['N° Inventario'], eq.ident['Serie']);
+        console.log('Registrar evento — equipo:', getIdent(eq.ident,'N° Inventario'), getIdent(eq.ident,'Serie'));
       });
       lucide.createIcons();
     }
@@ -587,11 +749,11 @@
     });
 
     function renderCabecera(eq) {
-      const nombre = esc(eq.ident['Equipo'] || '—');
-      const mm = esc([eq.ident['Marca'], eq.ident['Modelo']].filter(Boolean).join(' · '));
-      const ubi = esc(eq.ident['Ubicación'] || '');
-      const clas = esc(eq.ident['Clasificación'] || '');
-      const srv = esc(eq.ident['Servicio'] || '');
+      const nombre = esc(getIdent(eq.ident,'Equipo') || '—');
+      const mm = esc([getIdent(eq.ident,'Marca'), getIdent(eq.ident,'Modelo')].filter(Boolean).join(' · '));
+      const ubi = esc(getIdent(eq.ident,'Ubicación') || '');
+      const clas = esc(getIdent(eq.ident,'Clasificación') || '');
+      const srv = esc(getIdent(eq.ident,'Servicio') || '');
       return `
         <div class="flex-1 min-w-0">
           <div class="flex items-center gap-2 flex-wrap mb-1">
@@ -612,7 +774,10 @@
     }
 
     function renderIdentificacion(eq) {
-      const campos = COL_IDENT.filter(c => eq.ident[c] !== undefined);
+      // Mostrar TODAS las columnas detectadas del Excel, en su orden original;
+      // si no hay (mock o vacío), usar la lista canónica.
+      let campos = Object.keys(eq.ident).filter(k => k && !esColumnaIgnorada(k));
+      if (!campos.length) campos = COL_IDENT.filter(c => eq.ident[c] !== undefined);
       const cells = campos.map(c => {
         const v = eq.ident[c];
         const val = (v === '' || v == null) ? '—' : String(v);
@@ -627,6 +792,7 @@
         <div class="bg-zinc-900/40 border border-zinc-800 rounded-lg p-4">
           <div class="text-[11px] mono uppercase tracking-wider text-zinc-500 mb-3 flex items-center gap-2">
             <i data-lucide="package" class="w-3.5 h-3.5"></i> Identificación
+            <span class="ml-auto text-zinc-600">${campos.length} campos</span>
           </div>
           <div class="grid grid-cols-2 md:grid-cols-4 gap-2">${cells}</div>
         </div>
@@ -773,8 +939,8 @@
     }
 
     function renderFooter(eq) {
-      const inv = esc(eq.ident['N° Inventario'] || '—');
-      const ser = esc(eq.ident['Serie'] || '—');
+      const inv = esc(getIdent(eq.ident,'N° Inventario') || '—');
+      const ser = esc(getIdent(eq.ident,'Serie') || '—');
       return `
         <div class="flex-1 min-w-0 flex items-center gap-4 flex-wrap">
           <span>Inv: <span class="text-zinc-200">${inv}</span></span>
